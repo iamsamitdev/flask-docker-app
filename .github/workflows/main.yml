@@ -1,0 +1,61 @@
+# ชื่อง่ายๆ ของ Workflow ที่จะแสดงในหน้า Actions ของ GitHub
+name: CI/CD - Flask Docker App
+
+# กำหนด Trigger: ให้ Workflow นี้ทำงานทุกครั้งที่มีการ push ไปยัง branch 'main'
+on:
+  push:
+    branches: [ "main" ]
+
+# กำหนด Jobs ที่จะให้ทำงาน
+jobs:
+  build-and-push:
+    # กำหนดสภาพแวดล้อมที่จะรัน Job นี้ (ใช้ Ubuntu ของ GitHub)
+    runs-on: ubuntu-latest
+
+    # กำหนดขั้นตอนการทำงาน (Steps)
+    steps:
+      # 1. Checkout Code: ดึงโค้ดจาก Repository ลงมาที่ Runner
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Login to Docker Hub: ล็อกอินเข้า Docker Hub โดยใช้ Secrets
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # 3. Build and Push Docker Image: สร้างและ Push Image
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/my-flask-api:latest, ${{ secrets.DOCKERHUB_USERNAME }}/my-flask-api:${{ github.sha }}
+
+      # 4. Notify N8N on Success: แจ้งเตือน N8N เมื่อสำเร็จ
+      - name: Notify N8N on Success
+        if: success() # ทำงานเมื่อ Step ก่อนหน้าทั้งหมดสำเร็จ
+        run: |
+          curl -X POST -H "Content-Type: application/json" \
+          -d '{
+              "status": "SUCCESS",
+              "project": "${{ github.repository }}",
+              "commit": "${{ github.sha }}",
+              "imageUrl": "${{ secrets.DOCKERHUB_USERNAME }}/your-image-name:latest",
+              "workflowRunUrl": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          }' \
+          '${{ secrets.N8N_WEBHOOK_URL }}'
+
+      # 5. Notify N8N on Failure: แจ้งเตือน N8N เมื่อล้มเหลว
+      - name: Notify N8N on Failure
+        if: failure() # ทำงานเมื่อมี Step ใดๆ ล้มเหลว
+        run: |
+          curl -X POST -H "Content-Type: application/json" \
+          -d '{
+              "status": "FAILED",
+              "project": "${{ github.repository }}",
+              "commit": "${{ github.sha }}",
+              "workflowRunUrl": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          }' \
+          '${{ secrets.N8N_WEBHOOK_URL }}'
