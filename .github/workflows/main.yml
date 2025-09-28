@@ -2,60 +2,207 @@
 name: CI/CD - Flask Docker App
 
 # กำหนด Trigger: ให้ Workflow นี้ทำงานทุกครั้งที่มีการ push ไปยัง branch 'main'
+# on:
+#   push:
+#     branches: [ "main" ]
+#     # ถ้าต้องการ build ตอนแท็กด้วย ให้เปิดบรรทัดด้านล่าง
+#     # tags: [ 'v*.*.*' ]
+
+# กำหนด Trigger: ให้ Workflow นี้ทำงานทุกครั้งที่มีการสร้าง Pull Request ไปยัง branch 'main'
+# on:
+#   pull_request:
+#     branches: [ "main" ]
+
+# กำหนด Trigger: แบบ Manual (Workflow Dispatch) เพื่อให้สามารถกดรันได้เองจากหน้า GitHub
 on:
-  push:
-    branches: [ "main" ]
+  workflow_dispatch:
+
+# กำหนดใช้หลายๆ Trigger พร้อมกัน
+# on:
+#   push:
+#     branches: [ "main" ]
+#   pull_request:
+#     branches: [ "main" ]
+#   workflow_dispatch:
+
+# กำหนด Environment Variables ที่จะใช้ใน Workflow นี้
+env:
+  DOCKER_REPO: iamsamitdev/flask-docker-app
+  APP_NAME: flask-docker-app
 
 # กำหนด Jobs ที่จะให้ทำงาน
 jobs:
-  build-and-push:
-    # กำหนดสภาพแวดล้อมที่จะรัน Job นี้ (ใช้ Ubuntu ของ GitHub)
-    runs-on: ubuntu-latest
-
-    # กำหนดขั้นตอนการทำงาน (Steps)
+  # 1) ติดตั้งและรันเทสต์ (matrix: Linux/Windows)
+  test:
+    name: Install & Test (Python 3.x)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, windows-latest ]
+    runs-on: ${{ matrix.os }}
     steps:
-      # 1. Checkout Code: ดึงโค้ดจาก Repository ลงมาที่ Runner
-      - name: Checkout repository
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Test
+        run: |
+          pytest -v --tb=short
+      - name: Notify failure to n8n
+        if: failure()
+        run: |
+          curl -s -X POST "${{ secrets.N8N_WEBHOOK_URL }}" \
+            -H 'Content-Type: application/json' \
+            -d '{
+              "project": "${{ github.repository }}",
+              "stage": "Install & Test",
+              "status": "failed",
+              "build": "${{ github.run_number }}",
+              "image": "'"'"${{ env.DOCKER_REPO }}:latest"'"'",
+              "container": "'"'"${{ env.APP_NAME }}"'"'",
+              "url": "http://localhost:5000/"
+            }'
+
+  # 2) Build & Push Docker image
+  build_and_push:
+    name: Build & Push Docker
+    runs-on: ubuntu-latest
+    needs: test
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # 2. Login to Docker Hub: ล็อกอินเข้า Docker Hub โดยใช้ Secrets
-      - name: Log in to Docker Hub
+      - name: Docker metadata (tags & labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCKER_REPO }}
+          tags: |
+            type=raw,value=${{ github.run_number }}
+            type=raw,value=latest
+            type=sha,format=short
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # 3. Build and Push Docker Image: สร้างและ Push Image
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+      - name: Build & Push
+        uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/my-flask-api:latest, ${{ secrets.DOCKERHUB_USERNAME }}/my-flask-api:${{ github.sha }}
+          # หมายเหตุ: Flask Dockerfile ไม่มี multi-stage target 'production' จึงไม่ระบุ target ที่นี่
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-      # 4. Notify N8N on Success: แจ้งเตือน N8N เมื่อสำเร็จ
-      - name: Notify N8N on Success
-        if: success() # ทำงานเมื่อ Step ก่อนหน้าทั้งหมดสำเร็จ
+      - name: Notify success to n8n (Build & Push)
+        if: success()
         run: |
-          curl -X POST -H "Content-Type: application/json" \
-          -d '{
-              "status": "SUCCESS",
+          curl -s -X POST "${{ secrets.N8N_WEBHOOK_URL }}" \
+            -H 'Content-Type: application/json' \
+            -d '{
               "project": "${{ github.repository }}",
-              "commit": "${{ github.sha }}",
-              "imageUrl": "${{ secrets.DOCKERHUB_USERNAME }}/your-image-name:latest",
-              "workflowRunUrl": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          }' \
-          '${{ secrets.N8N_WEBHOOK_URL }}'
+              "stage": "Build & Push",
+              "status": "success",
+              "build": "${{ github.run_number }}",
+              "image": "'"'"${{ env.DOCKER_REPO }}:latest"'"'",
+              "container": "'"'"${{ env.APP_NAME }}"'"'",
+              "url": "http://localhost:5000/"
+            }'
 
-      # 5. Notify N8N on Failure: แจ้งเตือน N8N เมื่อล้มเหลว
-      - name: Notify N8N on Failure
-        if: failure() # ทำงานเมื่อมี Step ใดๆ ล้มเหลว
+      - name: Notify failure to n8n (Build & Push)
+        if: failure()
         run: |
-          curl -X POST -H "Content-Type: application/json" \
-          -d '{
-              "status": "FAILED",
+          curl -s -X POST "${{ secrets.N8N_WEBHOOK_URL }}" \
+            -H 'Content-Type: application/json' \
+            -d '{
               "project": "${{ github.repository }}",
-              "commit": "${{ github.sha }}",
-              "workflowRunUrl": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          }' \
-          '${{ secrets.N8N_WEBHOOK_URL }}'
+              "stage": "Build & Push",
+              "status": "failed",
+              "build": "${{ github.run_number }}",
+              "image": "'"'"${{ env.DOCKER_REPO }}:latest"'"'",
+              "container": "'"'"${{ env.APP_NAME }}"'"'",
+              "url": "http://localhost:5000/"
+            }'
+
+  # 3) Smoke Test (รันคอนเทนเนอร์บน runner แล้วตรวจสุขภาพ)
+  smoke_test:
+    name: Smoke Test (run & curl)
+    runs-on: ubuntu-latest
+    needs: build_and_push
+    steps:
+      - name: Pull latest
+        run: docker pull ${{ env.DOCKER_REPO }}:latest
+
+      - name: Run container
+        run: |
+          docker rm -f ${{ env.APP_NAME }} || true
+          docker run -d --name ${{ env.APP_NAME }} -p 5000:5000 ${{ env.DOCKER_REPO }}:latest
+          # รอแอปพร้อมให้บริการ
+          for i in {1..20}; do
+            if curl -fsS http://localhost:5000/ >/dev/null; then
+              echo "App is up"
+              exit 0
+            fi
+            echo "Waiting for app ($i)..."
+            sleep 2
+          done
+          echo "App not responding in time" >&2
+          docker logs ${{ env.APP_NAME }} || true
+          exit 1
+
+      - name: Show running container
+        run: docker ps --filter "name=${{ env.APP_NAME }}" --format "table {{.Names}}\t{{.Image}}\t{{.Status}}"
+
+      - name: Notify success to n8n (Deploy Local)
+        if: success()
+        run: |
+          curl -s -X POST "${{ secrets.N8N_WEBHOOK_URL }}" \
+            -H 'Content-Type: application/json' \
+            -d '{
+              "project": "${{ github.repository }}",
+              "stage": "Deploy Local",
+              "status": "success",
+              "build": "${{ github.run_number }}",
+              "image": "'"'"${{ env.DOCKER_REPO }}:latest"'"'",
+              "container": "'"'"${{ env.APP_NAME }}"'"'",
+              "url": "http://localhost:5000/"
+            }'
+
+      - name: Notify failure to n8n (Deploy Local)
+        if: failure()
+        run: |
+          curl -s -X POST "${{ secrets.N8N_WEBHOOK_URL }}" \
+            -H 'Content-Type: application/json' \
+            -d '{
+              "project": "${{ github.repository }}",
+              "stage": "Deploy Local",
+              "status": "failed",
+              "build": "${{ github.run_number }}",
+              "image": "'"'"${{ env.DOCKER_REPO }}:latest"'"'",
+              "container": "'"'"${{ env.APP_NAME }}"'"'",
+              "url": "http://localhost:5000/"
+            }'
+
+      - name: Cleanup Docker cache/images
+        if: always()
+        run: |
+          docker rm -f ${{ env.APP_NAME }} || true
+          docker image prune -af -f || true
+          docker builder prune -af -f || true
